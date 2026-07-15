@@ -1,0 +1,39 @@
+# Browser profiles (contain saved cookies/sessions — don't share)
+chrome_profile/
+chrome_profile_*/
+
+# Environment / secrets (DB credentials)
+.env
+
+# Generated PDFs
+pdfs/
+*.pdf
+
+# Screenshots (debug only)
+screenshots/
+
+# Excel uploads (may contain sensitive data)
+uploaded_royalty.xlsx
+temp_upload.xlsx
+royalty_result.xlsx
+mp_upload_*.xlsx
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+venv/
+env/
+
+# Local Windows run scripts
+python_path.txt
+
+# Debug/test files
+*.html
+inspect_*.png
+transit_pass_*.html
+test_*.py
+scratch_*.py
+patch_preview.py
