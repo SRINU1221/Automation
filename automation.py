@@ -112,41 +112,68 @@ async def safe_click(page: Page, selectors: list[str], timeout: int = 5000) -> b
 async def wait_for_ajax(page: Page, timeout: int = 8000):
     """
     Wait for ASP.NET AJAX PostBack to complete.
-    If a postback is in progress, waits until 'endRequest' is fired.
-    Otherwise, returns immediately.
+
+    Strategy (fixes race condition on slow connections like Mamidipally):
+      1. Poll up to 500 ms waiting for the postback to START
+         (isInAsyncPostBack transitions from false → true).
+      2. Once started, wait for it to FINISH (endRequest event).
+      3. If Sys/PRM is unavailable, fall back to a plain 500 ms sleep.
+
+    This is safe for all plants — on fast connections the postback starts
+    within the first 80 ms poll and the behaviour is identical to before.
     """
     try:
-        # Give a very brief moment (80ms) for the browser to trigger/start the postback
-        # if the change event was queued
-        await page.wait_for_timeout(80)
-        
         await page.evaluate("""
             (timeoutMs) => {
                 return new Promise((resolve, reject) => {
-                    if (typeof Sys !== 'undefined' && Sys.WebForms && Sys.WebForms.PageRequestManager) {
-                        const prm = Sys.WebForms.PageRequestManager.getInstance();
+                    if (typeof Sys === 'undefined' ||
+                        !Sys.WebForms ||
+                        !Sys.WebForms.PageRequestManager) {
+                        return resolve();   // no UpdatePanel on this page
+                    }
+
+                    const prm = Sys.WebForms.PageRequestManager.getInstance();
+
+                    // ── Helper: attach endRequest listener and wait for finish ──
+                    function waitForFinish() {
+                        const handler = () => {
+                            prm.remove_endRequest(handler);
+                            clearTimeout(tid);
+                            resolve();
+                        };
+                        const tid = setTimeout(() => {
+                            prm.remove_endRequest(handler);
+                            reject(new Error('AJAX PostBack timeout'));
+                        }, timeoutMs);
+                        prm.add_endRequest(handler);
+                    }
+
+                    // ── If a postback is already running, wait for finish ──────
+                    if (prm.get_isInAsyncPostBack()) {
+                        return waitForFinish();
+                    }
+
+                    // ── Not yet started — poll for up to 500ms (10 × 50ms) ────
+                    // This handles the race condition where select_option fires
+                    // the change event but the AJAX POST hasn't begun yet.
+                    let polls = 0;
+                    const maxPolls = 10;
+                    const pollInterval = setInterval(() => {
+                        polls++;
                         if (prm.get_isInAsyncPostBack()) {
-                            const handler = () => {
-                                prm.remove_endRequest(handler);
-                                clearTimeout(tid);
-                                resolve();
-                            };
-                            const tid = setTimeout(() => {
-                                prm.remove_endRequest(handler);
-                                reject(new Error("AJAX PostBack timeout"));
-                            }, timeoutMs);
-                            prm.add_endRequest(handler);
-                        } else {
+                            clearInterval(pollInterval);
+                            waitForFinish();
+                        } else if (polls >= maxPolls) {
+                            // Postback never started in 500ms — nothing to wait for
+                            clearInterval(pollInterval);
                             resolve();
                         }
-                    } else {
-                        resolve();
-                    }
+                    }, 50);
                 });
             }
         """, timeout)
     except Exception:
-        # Fallback if Sys is not defined or error occurs
+        # Fallback if Sys is not defined or JS error occurs
         await page.wait_for_timeout(500)
 
 
@@ -2393,12 +2420,65 @@ class TransitPassAutomation:
             await take_screenshot(self.page, "step1_mdl_type_fail")
             return
 
-        # ── 1c: Wait for dynamic MDL dropdown to appear (AJAX postback) ──────
-        await wait_for_ajax(self.page, timeout=5000)
-        mdl_id_sel = await try_selectors(self.page, config.MDL_ID_DDL, timeout=5000)
+        # ── 1c: Explicitly dispatch 'change' event on type dropdown to guarantee
+        #        the ASP.NET UpdatePanel postback fires. Playwright's select_option()
+        #        does raise the event internally, but some ASP.NET configurations
+        #        listen via attachEvent/addEventListener on the element — the explicit
+        #        dispatchEvent ensures the postback actually starts on slow portals.
+        try:
+            await self.page.evaluate(
+                """(sel) => {
+                    const el = document.querySelector(sel);
+                    if (el) {
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                }""",
+                type_ddl_sel,
+            )
+        except Exception:
+            pass  # non-critical — postback may already have started
 
-        if not mdl_id_sel:
-            self.log("   ⚠️  Dynamic MDL dropdown not found — scanning page…")
+        # ── 1c: Wait for dynamic MDL dropdown to appear (AJAX postback) ──────
+        # Use a polling loop (up to 12 s) instead of a single try_selectors call.
+        # This is the key fix for Mamidipally — the portal renders the MDL ID
+        # dropdown AFTER the UpdatePanel refresh, which can take 5–10 s on a
+        # slow connection. The loop verifies both presence AND populated options.
+        self.log("   ⏳ Waiting for MDL ID dropdown to populate…")
+        mdl_id_sel = None
+        mdl_dropdown_ready = False
+        for _poll in range(24):   # 24 × 500ms = 12 s max
+            await wait_for_ajax(self.page, timeout=10000)
+            candidate = await try_selectors(self.page, config.MDL_ID_DDL, timeout=800)
+            if candidate:
+                # Verify the dropdown has real (non-placeholder) options
+                try:
+                    option_count = await self.page.evaluate(
+                        """(sel) => {
+                            const el = document.querySelector(sel);
+                            if (!el) return 0;
+                            return Array.from(el.options).filter(o =>
+                                o.value && o.value !== '0' &&
+                                !['--select--', 'select', ''].includes(o.text.trim().toLowerCase())
+                            ).length;
+                        }""",
+                        candidate,
+                    )
+                    if option_count > 0:
+                        mdl_id_sel = candidate
+                        mdl_dropdown_ready = True
+                        self.log(f"   ✓ MDL ID dropdown ready [{candidate}] — {option_count} option(s)")
+                        break
+                    else:
+                        self.log(f"   ⏳ DDL found but empty (poll {_poll+1}/24) — waiting…")
+                except Exception:
+                    pass
+            else:
+                self.log(f"   ⏳ MDL ID DDL not visible yet (poll {_poll+1}/24)…")
+            await self.page.wait_for_timeout(500)
+
+        if not mdl_dropdown_ready:
+            # Last-chance scan — log what's on the page to help debug
+            self.log("   ⚠️  MDL ID dropdown not found after 12 s — scanning page…")
             fields2 = await discover_fields(self.page)
             ddls2 = [f for f in fields2 if f['tag'] == 'SELECT']
             self.log(f"   SELECT elements: {[(d['id'], d['name'], d['value']) for d in ddls2]}")
@@ -2454,8 +2534,10 @@ class TransitPassAutomation:
             self.log("   ❌ Could not select MDL ID — will try GET DETAILS anyway.")
             await take_screenshot(self.page, "step1_mdl_id_select_fail")
 
-        # Wait for AJAX after dynamic MDL selection
-        await wait_for_ajax(self.page, timeout=4000)
+        # Brief settle after MDL ID selection before clicking GET DETAILS.
+        # ASP.NET may fire a secondary validation postback on DDL change.
+        await self.page.wait_for_timeout(300)
+        await wait_for_ajax(self.page, timeout=10000)
 
         # ── 1e: Click GET DETAILS ─────────────────────────────────────────────
         ok = await safe_click(self.page, config.MDL_GET_DETAILS_BTN, timeout=5000)
@@ -2467,9 +2549,9 @@ class TransitPassAutomation:
             await take_screenshot(self.page, "step1_get_details_fail")
 
         # Wait for Aggregator dropdown (confirms GET DETAILS response loaded)
-        agg_ready = await try_selectors(self.page, config.AGGREGATOR_DDL, timeout=8000)
+        agg_ready = await try_selectors(self.page, config.AGGREGATOR_DDL, timeout=10000)
         if not agg_ready:
-            await wait_for_ajax(self.page, timeout=4000)
+            await wait_for_ajax(self.page, timeout=10000)
         self.log("   ✅ Step 1 complete.")
 
 
@@ -2491,7 +2573,7 @@ class TransitPassAutomation:
                        and 'TypeOfMDL' not in d['id'] and 'AllMDLs' not in d['id']
                        and 'ConsigneeType' not in d['id']]
             if non_mdl:
-                agg_sel = f"select#{non_mdl[-1]['id']}" if non_mdl[-1]['id'] else None
+                agg_sel = f"select#{non_mdl[0]['id']}" if non_mdl[0]['id'] else None
                 self.log(f"   Auto-detected aggregator dropdown: [{agg_sel}]")
             if not agg_sel:
                 self.log("   ❌ Cannot find Aggregators dropdown — skipping Step 2.")
@@ -2565,11 +2647,11 @@ class TransitPassAutomation:
     async def _step3_consignee(self, record: dict):
         self.log("📋 Step 3 — CONSIGNEE INFO form…")
 
-        # Wait for Consignee Info form to appear (portal AJAX after aggregator selection)
-        qty_sel = await try_selectors(self.page, config.DISPATCH_QTY_INPUT, timeout=5000)
-        if not qty_sel:
-            # Brief wait if somehow not ready yet
-            await self.page.wait_for_timeout(500)
+        # Wait for Stationary No field to appear (confirms Consignee Info section
+        # has rendered after Aggregator selection AJAX postback).
+        stat_wait = await try_selectors(self.page, config.STATIONARY_NO_INPUT, timeout=8000)
+        if not stat_wait:
+            await wait_for_ajax(self.page, timeout=8000)
 
         # ── 3b: Read values from Excel record
         qty     = str(record.get("dispatch_qty",  "")).strip()
@@ -2577,9 +2659,30 @@ class TransitPassAutomation:
         stat_no = str(record.get("stationary_no", "")).strip()
         self.log(f"   Qty='{qty}' | Sale='{sales}' | StatNo='{stat_no}'")
 
-        # ── 3c: Fill fields — sequential (ASP.NET may react to each change)
-        ok = await safe_fill(self.page, config.DISPATCH_QTY_INPUT, qty)
-        self.log(f"   Dispatch Qty: {'✓' if ok else '⚠ not found'}")
+        # ── 3c: Dispatch Quantity ──────────────────────────────────────────────
+        # On the MDL portal, ActualDisptchQty is READ-ONLY — the portal pre-fills
+        # it from the permit record after GET DETAILS. Detect and skip gracefully.
+        qty_sel = await try_selectors(self.page, config.DISPATCH_QTY_INPUT, timeout=2000)
+        if qty_sel:
+            is_readonly = await self.page.evaluate(
+                """(sel) => {
+                    const el = document.querySelector(sel);
+                    if (!el) return true;
+                    return el.readOnly || el.disabled;
+                }""",
+                qty_sel,
+            )
+            if is_readonly:
+                pval = await self.page.evaluate(
+                    "(sel) => { const el = document.querySelector(sel); return el ? el.value : ''; }",
+                    qty_sel,
+                )
+                self.log(f"   Dispatch Qty: ℹ️ read-only (portal value='{pval}') — skipping fill")
+            else:
+                ok = await safe_fill(self.page, config.DISPATCH_QTY_INPUT, qty)
+                self.log(f"   Dispatch Qty: {'✓' if ok else '⚠ not found'}")
+        else:
+            self.log("   Dispatch Qty: ℹ️ field not visible (auto-filled by portal)")
 
         ok = await safe_fill(self.page, config.SALES_VALUE_INPUT, sales)
         self.log(f"   Sale Value: {'✓' if ok else '⚠ not found'}")
@@ -2587,14 +2690,22 @@ class TransitPassAutomation:
         ok = await safe_fill(self.page, config.STATIONARY_NO_INPUT, stat_no)
         self.log(f"   Stationary No: {'✓' if ok else '⚠ not found'}")
 
-        # ── 3d: Click Next — then wait for Vehicle/Driver form to appear
-        ok = await safe_click(self.page, config.CONSIGNEE_NEXT_BTN, timeout=8000)
-        self.log(f"   Next button: {'✓ clicked' if ok else '⚠ not found — pressing Enter'}")
+        # ── 3f: Click CALCULATE (MDL portal) or NEXT (other portals) ────────
+        # The MDL portal uses a CALCULATE button (id=*Calculation) to trigger
+        # the AJAX postback that reveals the Vehicle/Driver section.
+        # NEXT button selectors are kept as fallback for other portal variants.
+        calculate_and_next_btns = [
+            "input[id*='MDLRMTP_Calculation']",
+            "input[id*='Calculation']",
+            "input[value='CALCULATE']",
+            "input[value='Calculate']",
+            "button:has-text('CALCULATE')",
+            "button:has-text('Calculate')",
+        ] + list(config.CONSIGNEE_NEXT_BTN)
+        ok = await safe_click(self.page, calculate_and_next_btns, timeout=8000)
+        self.log(f"   Calculate/Next: {'✓ clicked' if ok else '⚠ not found — pressing Enter'}")
         if not ok:
             await self.page.keyboard.press("Enter")
-
-        # Wait briefly for AJAX postback response
-        await self.page.wait_for_timeout(1500)
 
         # ── Check for validation error (e.g. invalid stationary number) ──────
         _val_err = await self._detect_page_error()
@@ -2604,13 +2715,25 @@ class TransitPassAutomation:
             self._stop = True
             raise ValueError(f"Stationary number validation: {_val_err}")
 
-        # Wait for Vehicle Type dropdown (confirms Step 4 form loaded)
-        vehicle_appeared = await try_selectors(
-            self.page, config.VEHICLE_TYPE_DDL, timeout=8000
-        )
+        # ── Poll for Vehicle Type dropdown (signals Step 4 form is ready) ────
+        # After CALCULATE the portal AJAX-renders the Vehicle/Driver section.
+        # Poll up to 15 s (30 × 500 ms) to ensure it's ready before Step 4.
+        self.log("   ⏳ Waiting for Vehicle/Driver section to appear…")
+        vehicle_appeared = False
+        for _vp in range(30):   # 30 × 500ms = 15 s max
+            v_sel = await try_selectors(self.page, config.VEHICLE_TYPE_DDL, timeout=800)
+            if v_sel:
+                vehicle_appeared = True
+                self.log(f"   ✓ Vehicle/Driver section ready [{v_sel}]")
+                break
+            await self.page.wait_for_timeout(500)
         if not vehicle_appeared:
-            await self.page.wait_for_timeout(500)  # brief grace only
+            await take_screenshot(self.page, f"step3_no_vehicle_section_{stat_no}")
+            fields_dbg = await discover_fields(self.page)
+            self.log(f"   ⚠️  Vehicle/Driver section not found after 15 s — "
+                     f"fields: {[f['id'] for f in fields_dbg if f['id']][:20]}")
         self.log("   ✅ Step 3 complete.")
+
 
     # ── Step 4: Vehicle & Driver → Print ──────────────────────
 
