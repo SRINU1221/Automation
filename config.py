@@ -444,6 +444,9 @@ TP_SUBMIT_BTN = [
 DELAY_BETWEEN_RECORDS = 3.0
 PAGE_LOAD_TIMEOUT     = 30_000
 ELEMENT_TIMEOUT       = 10_000
+# OTP_WAIT_TIMEOUT is kept for any direct / non-UI callers.
+# The Multi-Plant UI uses an indefinite polling loop (_otp_wait in multi_plant.py)
+# so the OTP input field stays enabled until the user submits the OTP or clicks Stop.
 OTP_WAIT_TIMEOUT      = 180
 MAX_RETRIES           = 2
 STOP_ON_FAILURE       = False  # If True → stop all remaining records when any one record fails

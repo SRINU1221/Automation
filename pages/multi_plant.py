@@ -396,13 +396,23 @@ with _col_l:
                 _lq = _r["log_q"]; _oq = _r["otp_resp_q"]
                 _lq.put(f"🚀 [{_ps['plant_name']}] Starting — {len(_ps['records'])} records")
                 loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
+
+                def _otp_wait(q=_oq, stop=_r["stop_event"]):
+                    """Wait indefinitely for OTP — polls in 2-s slices so Stop button still works."""
+                    while not stop.is_set():
+                        try:
+                            return q.get(timeout=2)
+                        except queue.Empty:
+                            continue  # keep waiting until user submits OTP or Stop is pressed
+                    return None  # stop was requested
+
                 try:
                     config.DELAY_BETWEEN_RECORDS = _ps["delay"]
                     res = loop.run_until_complete(_rb2(
                         records=_ps["records"], username=_ps["username"],
                         password=_ps["password"],
                         log_fn=lambda m,q=_lq: q.put(m),
-                        otp_fn=lambda q=_oq: q.get(timeout=config.OTP_WAIT_TIMEOUT),
+                        otp_fn=_otp_wait,
                         progress_fn=lambda d,t,q=_lq: q.put(f"__PROGRESS__{d}__{t}"),
                         headless=_h, pdf_folder=_ps["pdf_folder"],
                         mode=_ps["mode"], chrome_profile_dir=_prof,
