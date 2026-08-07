@@ -110,8 +110,12 @@ for _pn, _rt in st.session_state.mp_rt.items():
             _rt["error_msg"] = _m[len("__ERROR__"):]
             _rt["running"] = False; _rt["done"] = True
         elif _m.startswith("__PROGRESS__"):
-            _,_,d,t = _m.split("__")
-            _rt["progress_done"] = int(d); _rt["progress_total"] = int(t)
+            try:
+                _prog = _m[len("__PROGRESS__"):]
+                d, t = _prog.split("__")
+                _rt["progress_done"] = int(d); _rt["progress_total"] = int(t)
+            except Exception:
+                pass
         elif _m.startswith("__RECORD_DONE__"):
             r = _m[len("__RECORD_DONE__"):].strip()
             if r == "success":  _rt["live_success"] += 1
@@ -124,6 +128,9 @@ for _pn, _rt in st.session_state.mp_rt.items():
             if p and p not in _rt["pdf_files"]: _rt["pdf_files"].append(p)
         else:
             _rt["log_lines"].append(_m)
+            # Cap log lines to prevent Streamlit session state overflow with large record sets
+            if len(_rt["log_lines"]) > 500:
+                _rt["log_lines"] = _rt["log_lines"][-500:]
 
 # ── Sidebar — plant navigator ─────────────────────────────────────────────────
 with st.sidebar:
@@ -507,20 +514,30 @@ box-shadow:0 4px 24px rgba(239,68,68,.25);">
     else:
         st.info("⚠️ Fix the error above first — OTP field is hidden until error is dismissed.")
 
-    # Stats
-    if _rt["running"] or _rt["done"]:
-        _tot = max(_rt["progress_total"] or len(_cfg.get("records",[])), 1)
+    # Stats — always show when records are loaded, running, or done
+    _records_count = len(_cfg.get("records", []))
+    if _rt["running"] or _rt["done"] or _records_count > 0:
+        # Prefer progress_total (set by automation thread) else fall back to loaded records count
+        _tot = _rt["progress_total"] if _rt["progress_total"] > 0 else _records_count
+        _tot = max(_tot, 1)
         _suc = _rt["live_success"]; _fal = _rt["live_failed"]; _skp = _rt["live_skipped"]
-        _pend = max(0, _tot - _suc - _fal - _skp)
+        _done_count = _suc + _fal + _skp
+        _pend = max(0, _tot - _done_count)
+        _comp = _suc  # completed = successful
         st.markdown(f"""<div class="sg">
 <div class="sb"><div class="sn c-blue">{_tot}</div><div class="sl">Total</div></div>
 <div class="sb"><div class="sn c-green">{_suc}</div><div class="sl">✅ Success</div></div>
 <div class="sb"><div class="sn c-red">{_fal}</div><div class="sl">❌ Failed</div></div>
 <div class="sb"><div class="sn c-yellow">{_pend}</div><div class="sl">⏳ Pending</div></div>
 </div>""", unsafe_allow_html=True)
-        if _rt["running"] and _rt["progress_total"] > 0:
-            st.progress(_rt["progress_done"] / _rt["progress_total"],
-                        text=f"Record {_rt['progress_done']}/{_rt['progress_total']}")
+        if _rt["running"]:
+            _prog_done = _rt["progress_done"] if _rt["progress_done"] > 0 else _done_count
+            _prog_total = _rt["progress_total"] if _rt["progress_total"] > 0 else _tot
+            if _prog_total > 0:
+                st.progress(
+                    min(_prog_done / _prog_total, 1.0),
+                    text=f"Record {_prog_done}/{_prog_total} · ✅ {_suc} success · ❌ {_fal} failed"
+                )
 
     # Log
     st.markdown('<div class="card"><div class="card-t">📋 Live Log</div>',

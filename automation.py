@@ -1728,6 +1728,7 @@ class TransitPassAutomation:
         headless:    bool = config.HEADLESS,
         mode:        str = "MDL",
         chrome_profile_dir: Optional[str] = None,
+        pdf_folder:  Optional[str] = None,
     ):
         self.log        = log_fn
         self.otp_fn     = otp_fn
@@ -1735,6 +1736,8 @@ class TransitPassAutomation:
         self.headless   = headless
         self.mode       = mode
         self.chrome_profile_dir = chrome_profile_dir or "chrome_profile"
+        # Each plant gets its own isolated PDF folder — never share via global config
+        self.pdf_save_folder = pdf_folder or config.PDF_SAVE_FOLDER
         self.playwright = None
         self.browser:   Optional[Browser]        = None
         self.context:   Optional[BrowserContext] = None
@@ -1752,8 +1755,8 @@ class TransitPassAutomation:
         self.log("🌐 Starting Playwright…")
         self.playwright = await async_playwright().start()
 
-        # Ensure PDF output folder exists
-        pdf_folder = Path(config.PDF_SAVE_FOLDER).resolve()
+        # Ensure PDF output folder exists — use instance-level folder (not global config)
+        pdf_folder = Path(self.pdf_save_folder).resolve()
         pdf_folder.mkdir(parents=True, exist_ok=True)
         self.log(f"📁 PDF save folder: {pdf_folder}")
 
@@ -3017,7 +3020,8 @@ class TransitPassAutomation:
             return "".join(c if c.isalnum() or c in "-_" else "_" for c in str(s)).strip("_")
 
         ts         = int(time.time())
-        pdf_folder = Path(config.PDF_SAVE_FOLDER).resolve()
+        # Use instance-level pdf_save_folder so parallel plants don't overwrite each other
+        pdf_folder = Path(self.pdf_save_folder).resolve()
         pdf_folder.mkdir(parents=True, exist_ok=True)
         fname      = f"{_safe(stat)}.pdf" if stat else f"TP_{_safe(veh)}_{ts}.pdf"
         pdf_path   = pdf_folder / fname
@@ -3132,10 +3136,9 @@ async def run_batch(
 
     pdf_folder: override the default PDF save folder (config.PDF_SAVE_FOLDER).
     """
-    # Override config if caller supplied a folder
-    if pdf_folder:
-        config.PDF_SAVE_FOLDER = pdf_folder
-
+    # Pass pdf_folder directly into the engine as an instance variable.
+    # NEVER mutate config.PDF_SAVE_FOLDER — it's a global shared across all threads,
+    # so setting it here would corrupt the PDF path for any other plant running in parallel.
     engine = TransitPassAutomation(
         log_fn=log_fn,
         otp_fn=otp_fn,
@@ -3143,6 +3146,7 @@ async def run_batch(
         headless=headless,
         mode=mode,
         chrome_profile_dir=chrome_profile_dir,
+        pdf_folder=pdf_folder,
     )
     try:
         await engine.start()
