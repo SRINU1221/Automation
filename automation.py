@@ -3207,20 +3207,23 @@ async def run_batch(
             # boxes in real-time after every record, without waiting for the
             # final __RESULTS__ dump at the end of the batch.
             log_fn(f"__RECORD_DONE__{result}")
+            # Emit progress immediately after RECORD_DONE so both signals
+            # reach the UI queue together — keeps progress bar in sync.
+            if progress_fn:
+                progress_fn(i + 1, total)
 
             # ── Stop on failure ──────────────────────────────────────────────
             if result == "failed" and config.STOP_ON_FAILURE:
                 log_fn("🛑 STOP_ON_FAILURE is ON — stopping automation after this failure.")
                 log_fn(f"   Remaining {total - (i + 1)} record(s) will be marked as skipped.")
-                # Mark all remaining records as skipped
-                for remaining_record in records[i + 1:]:
+                # Mark all remaining records as skipped and emit progress for each
+                for j, remaining_record in enumerate(records[i + 1:], start=i + 1):
                     remaining_record["_status"] = "⏭️ Skipped (stopped on failure)"
                     remaining_record["_pdf"]    = ""
                     log_fn(f"__RECORD_DONE__skipped")
+                    if progress_fn:
+                        progress_fn(j + 1, total)
                 break
-
-            if progress_fn:
-                progress_fn(i + 1, total)
 
             # Brief pause between records (not after the last one)
             if i < total - 1 and not engine._stop:

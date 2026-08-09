@@ -568,6 +568,8 @@ box-shadow:0 4px 24px rgba(239,68,68,.25);">
         st.markdown('</div>', unsafe_allow_html=True)
 
 # ── Auto-refresh ──────────────────────────────────────────────────────────────
+# Keep the sleep short so the status bar (Pending/Success/Failed counts) and
+# progress bar refresh promptly, even when processing large batches quickly.
 if _any_running:
-    time.sleep(1.2)
+    time.sleep(0.8)
     st.rerun()
