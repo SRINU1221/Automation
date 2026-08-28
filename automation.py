@@ -33,6 +33,27 @@ import config
 
 
 # ─────────────────────────────────────────────────────────────────
+#  Custom exceptions
+# ─────────────────────────────────────────────────────────────────
+
+class MDLIDNotFoundError(Exception):
+    """
+    Raised when the MDL ID from the Excel file cannot be found in the
+    portal's dynamic dropdown.  This is a hard stop — the whole plant
+    automation is aborted so the operator can fix the Excel before
+    re-running rather than silently generating passes for the wrong MDL.
+    """
+    def __init__(self, mdl_id: str, available: list[str] | None = None):
+        self.mdl_id   = mdl_id
+        self.available = available or []
+        avail_str = ", ".join(self.available[:10]) if self.available else "(none)"
+        super().__init__(
+            f"MDL ID '{mdl_id}' not found in dropdown. "
+            f"Available options: {avail_str}"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────
 #  Low-level helpers
 # ─────────────────────────────────────────────────────────────────
 
@@ -2510,31 +2531,51 @@ class TransitPassAutomation:
                         self.log(f"   ✓ MDL ID matched: '{txt}' (value='{val}')")
                         break
                 if not ok:
-                    self.log(f"   ⚠️ No option matched '{mdl_id_target}' — will auto-select first")
+                    # ── MDL ID provided but not found — collect available options and STOP ──
+                    self.log(f"   ❌ MDL ID '{mdl_id_target}' NOT found in dropdown — stopping plant.")
+                    await take_screenshot(self.page, "step1_mdl_id_not_found")
+                    try:
+                        avail_opts = await self.page.query_selector_all(f"{mdl_id_sel} option")
+                        avail = [
+                            (await o.inner_text()).strip()
+                            for o in avail_opts
+                            if (await o.get_attribute("value") or "").strip() not in ("", "0")
+                            and (await o.inner_text()).strip().lower() not in ("--select--", "select")
+                        ]
+                    except Exception:
+                        avail = []
+                    raise MDLIDNotFoundError(mdl_id_target, avail)
+            except MDLIDNotFoundError:
+                raise   # let it propagate — do NOT swallow
             except Exception as e:
                 self.log(f"   MDL ID match error: {e}")
 
-        # Fallback: auto-select first valid option
+        # Fallback: auto-select first valid option ONLY when no MDL ID was given in Excel
         if not ok and mdl_id_sel:
             if not mdl_id_target:
-                self.log("   Auto-selecting first available MDL option…")
-            try:
-                opts = await self.page.query_selector_all(f"{mdl_id_sel} option")
-                for opt in opts:
-                    txt = (await opt.inner_text()).strip()
-                    val = (await opt.get_attribute("value") or "").strip()
-                    if txt and val and txt.lower() not in ("--select--", "select") and val not in ("", "0"):
-                        await self.page.select_option(mdl_id_sel, value=val)
-                        ok = True
-                        self.log(f"   ✓ Auto-selected first option: '{txt}' (value='{val}')")
-                        break
-                if not ok:
-                    self.log("   ⚠️ No valid options in MDL dropdown.")
-            except Exception as e3:
-                self.log(f"   Auto-select error: {e3}")
+                self.log("   Auto-selecting first available MDL option (no MDL ID in Excel)…")
+                try:
+                    opts = await self.page.query_selector_all(f"{mdl_id_sel} option")
+                    for opt in opts:
+                        txt = (await opt.inner_text()).strip()
+                        val = (await opt.get_attribute("value") or "").strip()
+                        if txt and val and txt.lower() not in ("--select--", "select") and val not in ("", "0"):
+                            await self.page.select_option(mdl_id_sel, value=val)
+                            ok = True
+                            self.log(f"   ✓ Auto-selected first option: '{txt}' (value='{val}')")
+                            break
+                    if not ok:
+                        self.log("   ⚠️ No valid options in MDL dropdown.")
+                except Exception as e3:
+                    self.log(f"   Auto-select error: {e3}")
 
-        if not ok:
-            self.log("   ❌ Could not select MDL ID — will try GET DETAILS anyway.")
+        if not ok and mdl_id_target:
+            # mdl_id was given but we still haven't selected — something unexpected happened
+            self.log("   ❌ Could not select MDL ID — stopping plant.")
+            await take_screenshot(self.page, "step1_mdl_id_select_fail")
+            raise MDLIDNotFoundError(mdl_id_target)
+        elif not ok:
+            self.log("   ❌ Could not select any MDL option — will try GET DETAILS anyway.")
             await take_screenshot(self.page, "step1_mdl_id_select_fail")
 
         # Brief settle after MDL ID selection before clicking GET DETAILS.
@@ -2841,26 +2882,40 @@ class TransitPassAutomation:
             except Exception as e:
                 self.log(f"   ⚠️ MDL ID match error: {e}")
 
-        # Fallback: select first valid option if no match found (or no ID provided)
+        # Fallback / error handling when MDL ID was provided but not matched
         if not ok:
             if mdl_id_target:
-                self.log(f"   ⚠️ No option matched '{mdl_id_target}' — auto-selecting first valid option")
+                # MDL ID given in Excel but NOT found in dropdown — collect options and STOP
+                self.log(f"   ❌ MDL ID '{mdl_id_target}' NOT found in TP dynamic dropdown — stopping plant.")
+                await take_screenshot(self.page, "tp_mdl_id_not_found")
+                try:
+                    avail_opts = await self.page.query_selector_all(f"{dynamic_ddl_sel} option")
+                    avail = [
+                        (await o.inner_text()).strip()
+                        for o in avail_opts
+                        if (await o.get_attribute("value") or "").strip() not in ("", "0")
+                        and (await o.inner_text()).strip().lower() not in ("--select--", "select")
+                    ]
+                except Exception:
+                    avail = []
+                raise MDLIDNotFoundError(mdl_id_target, avail)
             else:
+                # No MDL ID in Excel — auto-select first valid option
                 self.log("   ℹ️ No MDL ID in record — auto-selecting first valid option")
-            try:
-                opts = await self.page.query_selector_all(f"{dynamic_ddl_sel} option")
-                for opt in opts:
-                    txt = (await opt.inner_text()).strip()
-                    val = (await opt.get_attribute("value") or "").strip()
-                    if txt and val and txt.lower() not in ("--select--", "select") and val not in ("", "0"):
-                        await self.page.select_option(dynamic_ddl_sel, value=val)
-                        ok = True
-                        self.log(f"   ✓ First option auto-selected: '{txt}' (value='{val}')")
-                        break
-            except Exception as e:
-                self.log(f"   ⚠️ Auto-select error: {e}")
+                try:
+                    opts = await self.page.query_selector_all(f"{dynamic_ddl_sel} option")
+                    for opt in opts:
+                        txt = (await opt.inner_text()).strip()
+                        val = (await opt.get_attribute("value") or "").strip()
+                        if txt and val and txt.lower() not in ("--select--", "select") and val not in ("", "0"):
+                            await self.page.select_option(dynamic_ddl_sel, value=val)
+                            ok = True
+                            self.log(f"   ✓ First option auto-selected: '{txt}' (value='{val}')")
+                            break
+                except Exception as e:
+                    self.log(f"   ⚠️ Auto-select error: {e}")
 
-        if not ok:
+        if not ok and not mdl_id_target:
             self.log("   ⚠️ Could not select any MDL option — proceeding anyway")
 
         # Wait for AJAX after dynamic selection
@@ -3067,6 +3122,9 @@ class TransitPassAutomation:
                     self.log(f"⚠️  {label} — PDF not captured, retrying…")
                     await take_screenshot(self.page, f"warn_{row}_{attempt}")
 
+            except MDLIDNotFoundError:
+                # Hard stop — do not retry, propagate up to run_batch immediately
+                raise
             except Exception as e:
                 self.log(f"❌ {label} — error attempt {attempt}: {e}")
                 await take_screenshot(self.page, f"error_{row}_{attempt}")
@@ -3237,6 +3295,30 @@ async def run_batch(
         log_fn(f"📁 PDFs saved to: {Path(config.PDF_SAVE_FOLDER).resolve()}")
         log_fn(f"{'═'*55}")
 
+    except MDLIDNotFoundError as mdl_err:
+        # ── MDL ID mismatch — clear, actionable popup, stop entire plant ──
+        mdl_id   = mdl_err.mdl_id
+        avail    = mdl_err.available
+        avail_str = ", ".join(avail[:8]) if avail else "(no options loaded)"
+        log_fn(
+            f"__ERROR__"
+            f"🔴 MDL ID Not Found in Dropdown!"
+            f"|"
+            f"Excel MDL ID: '{mdl_id}' does not match any option in the portal dropdown.\n"
+            f"Available options in portal: {avail_str}"
+            f"|"
+            f"Fix the MDL ID in your Excel file to exactly match one of the portal options "
+            f"(e.g. '{avail[0].split()[0]}'), then re-upload and restart this plant."
+            if avail else
+            f"__ERROR__"
+            f"🔴 MDL ID Not Found in Dropdown!"
+            f"|"
+            f"Excel MDL ID: '{mdl_id}' does not match any option in the portal dropdown. "
+            f"The dropdown may still be loading or the MDL ID may be invalid."
+            f"|"
+            f"Check that the MDL ID in your Excel is correct, then re-upload and restart this plant."
+        )
+        log_fn(f"🛑 Plant stopped — MDL ID '{mdl_id}' not found. Fix Excel and restart.")
     except Exception as e:
         _short = str(e)[:300]
         log_fn(f"__ERROR__💥 Automation Error!|{_short}|Close the Chrome browser and try again. If the problem persists, check your credentials and internet connection.")
