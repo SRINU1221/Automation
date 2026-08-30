@@ -1229,6 +1229,28 @@ async def capture_pdf_from_print(
         log_fn(f"❌ Failed to open transit pass in new tab: {e}")
         return False
 
+    # ── Maximize / reposition the popup so it is visible to the user ──────────
+    # The form submit with target='_blank' may open a tiny window in the
+    # bottom-left corner. We resize and centre it immediately after capture.
+    try:
+        await popup.bring_to_front()
+        await popup.evaluate("""
+            () => {
+                try {
+                    const sw = window.screen.availWidth  || 1280;
+                    const sh = window.screen.availHeight || 800;
+                    const w  = Math.min(1280, sw);
+                    const h  = Math.min(900,  sh);
+                    const x  = Math.round((sw - w) / 2);
+                    const y  = Math.round((sh - h) / 2);
+                    window.resizeTo(w, h);
+                    window.moveTo(x, y);
+                } catch (e) { /* cross-origin restrictions — ignore */ }
+            }
+        """)
+    except Exception:
+        pass  # Non-critical — PDF generation proceeds regardless
+
     # ── Step 2: Wait for transit pass to fully render ─────────────────────────
     # Smart wait: poll for the PrintContent div or a permit table instead of blind waits
     try:
@@ -1834,13 +1856,14 @@ class TransitPassAutomation:
             headless=self.headless,
             slow_mo=0,           # no artificial delay — pure speed
             args=[
-                "--start-maximized",
+                "--start-maximized",          # open full-screen on launch
+                "--window-position=0,0",       # anchor to top-left of primary monitor
                 "--disable-blink-features=AutomationControlled",
                 "--allow-running-insecure-content",
                 "--disable-web-security",
                 "--ignore-certificate-errors",
             ],
-            viewport={"width": 1400, "height": 900},
+            no_viewport=True,    # let --start-maximized control size; viewport= overrides it
             ignore_https_errors=True,
             accept_downloads=True,
         )
@@ -1886,7 +1909,38 @@ class TransitPassAutomation:
             self.page = self.context.pages[0]
         else:
             self.page = await self.context.new_page()
-            
+
+        # ── Force-maximize Chrome window via Win32 API ─────────────────────────
+        # --start-maximized can be ignored when a Chrome profile already stores a
+        # previous window size/position. Win32 ShowWindow(SW_MAXIMIZE) is the
+        # guaranteed way to make the window fill the screen on Windows.
+        if not self.headless:
+            import ctypes, time as _time
+            _time.sleep(0.5)   # brief pause so Chrome window finishes creating
+            try:
+                SW_MAXIMIZE = 3
+
+                def _maximize_chrome():
+                    hwnd_list = []
+
+                    def _cb(hwnd, _):
+                        cls = ctypes.create_unicode_buffer(256)
+                        ctypes.windll.user32.GetClassNameW(hwnd, cls, 256)
+                        if cls.value == "Chrome_WidgetWin_1":
+                            if ctypes.windll.user32.IsWindowVisible(hwnd):
+                                hwnd_list.append(hwnd)
+                        return True
+
+                    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)
+                    ctypes.windll.user32.EnumWindows(WNDENUMPROC(_cb), 0)
+                    for hwnd in hwnd_list:
+                        ctypes.windll.user32.ShowWindow(hwnd, SW_MAXIMIZE)
+                        ctypes.windll.user32.SetForegroundWindow(hwnd)
+
+                _maximize_chrome()
+            except Exception as _max_err:
+                self.log(f"⚠️ Could not force-maximize Chrome window: {_max_err}")
+
         self.log("✅ Browser launched with pre-configured print profile!")
 
 

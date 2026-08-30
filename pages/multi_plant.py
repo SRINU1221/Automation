@@ -334,7 +334,24 @@ with _col_l:
         _fid = f"{_up.name}_{_up.size}"
         if _cfg.get("_fid") != _fid:
             _sp = Path(f"mp_upload_{_sel.replace(' ','_')}.xlsx")
-            _sp.write_bytes(_up.read())
+            _tmp = _sp.with_suffix(".tmp.xlsx")
+            try:
+                # Write to a temp file first to avoid PermissionError when the
+                # target is locked by a running automation or Excel.
+                _tmp.write_bytes(_up.read())
+                # Atomic replace: works even if _sp already exists
+                try:
+                    _tmp.replace(_sp)
+                except PermissionError:
+                    # Target still locked — read records directly from the temp file
+                    _sp = _tmp
+            except PermissionError as _pe:
+                st.error(
+                    f"⚠️ Cannot save the uploaded file — it is currently locked by another "
+                    f"process (e.g. a running automation or Excel).\n\n"
+                    f"Please close any program that has **{_sp.name}** open, then re-upload."
+                )
+                st.stop()
             _recs, _ = load_records(str(_sp))
             _cfg["records"] = _recs; _cfg["_fid"] = _fid
         st.success(f"✅ {len(_cfg['records'])} records loaded from {_up.name}")
