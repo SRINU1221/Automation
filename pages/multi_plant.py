@@ -70,6 +70,7 @@ def _make_rt():
         "stop_event": threading.Event(),
         "otp_requested": False, "otp_submitted": False,
         "running": False, "done": False,
+        "draining": False,   # True for one extra rerun after __DONE__ to flush queue
         "log_lines": [], "pdf_files": [],
         "live_success": 0, "live_failed": 0, "live_skipped": 0,
         "progress_done": 0, "progress_total": 0,
@@ -99,16 +100,18 @@ if st.session_state.mp_sel not in [p["plant_name"] for p in _db_plants]:
 # ── Drain ALL plant log queues on every rerun ─────────────────────────────────
 _any_running = False
 for _pn, _rt in st.session_state.mp_rt.items():
-    if not (_rt["running"] or _rt["done"]): continue
+    if not (_rt["running"] or _rt["done"] or _rt.get("draining")): continue
     if _rt["running"]: _any_running = True
+    _had_items = False
     while True:
         try: _m = _rt["log_q"].get_nowait()
         except queue.Empty: break
+        _had_items = True
         if _m == "__OTP_REQUESTED__":
             _rt["otp_requested"] = True; _rt["otp_submitted"] = False
         elif _m.startswith("__ERROR__"):
             _rt["error_msg"] = _m[len("__ERROR__"):]
-            _rt["running"] = False; _rt["done"] = True
+            _rt["running"] = False; _rt["done"] = True; _rt["draining"] = False
         elif _m.startswith("__PROGRESS__"):
             try:
                 _prog = _m[len("__PROGRESS__"):]
@@ -123,6 +126,12 @@ for _pn, _rt in st.session_state.mp_rt.items():
             elif r == "skipped":_rt["live_skipped"] += 1
         elif _m.startswith("__DONE__"):
             _rt["running"] = False; _rt["done"] = True
+            # Keep draining flag ON so the auto-refresh fires one more time
+            # to catch any __RECORD_DONE__ / __PROGRESS__ signals that were
+            # already enqueued before we processed __DONE__ this cycle.
+            _rt["draining"] = True
+        elif _m.startswith("__RESULTS__"):
+            pass  # Final JSON summary — already counted via __RECORD_DONE__ signals; discard.
         elif _m.startswith("__PDF__"):
             p = _m[len("__PDF__"):]
             if p and p not in _rt["pdf_files"]: _rt["pdf_files"].append(p)
@@ -131,6 +140,13 @@ for _pn, _rt in st.session_state.mp_rt.items():
             # Cap log lines to prevent Streamlit session state overflow with large record sets
             if len(_rt["log_lines"]) > 500:
                 _rt["log_lines"] = _rt["log_lines"][-500:]
+    # If we were draining and the queue is now empty, clear the draining flag.
+    if _rt.get("draining") and not _had_items:
+        _rt["draining"] = False
+    # If still draining (queue had items this cycle), keep auto-refresh going.
+    if _rt.get("draining"):
+        _any_running = True
+
 
 # ── Sidebar — plant navigator ─────────────────────────────────────────────────
 with st.sidebar:
@@ -408,7 +424,7 @@ with _col_l:
                     except: break
             _lrt["stop_event"].clear()
             _lrt.update({"otp_requested":False,"otp_submitted":False,
-                          "running":True,"done":False,"log_lines":[],"pdf_files":[],
+                          "running":True,"done":False,"draining":False,"log_lines":[],"pdf_files":[],
                           "error_msg":"","live_success":0,"live_failed":0,
                           "live_skipped":0,"progress_done":0,
                           "progress_total":len(_lps["records"])})
@@ -464,7 +480,7 @@ with _col_l:
     if _rt["done"]:
         if st.button("🗑️ Reset This Plant", use_container_width=True, key=f"reset_{_sel}"):
             _rt["stop_event"].clear()
-            _rt.update({"done":False,"log_lines":[],"pdf_files":[],"error_msg":"",
+            _rt.update({"done":False,"draining":False,"log_lines":[],"pdf_files":[],"error_msg":"",
                         "live_success":0,"live_failed":0,"live_skipped":0,
                         "progress_done":0,"progress_total":0,
                         "otp_requested":False,"otp_submitted":False})
@@ -494,7 +510,7 @@ box-shadow:0 4px 24px rgba(239,68,68,.25);">
         if st.button("✖ Dismiss & Reset Plant", use_container_width=True,
                      key=f"err_dismiss_{_sel}", type="secondary"):
             _rt["stop_event"].set()
-            _rt.update({"error_msg":"","done":False,"running":False,
+            _rt.update({"error_msg":"","done":False,"running":False,"draining":False,
                         "log_lines":[],"pdf_files":[],"otp_requested":False,
                         "otp_submitted":False,"live_success":0,"live_failed":0,
                         "live_skipped":0,"progress_done":0,"progress_total":0})
