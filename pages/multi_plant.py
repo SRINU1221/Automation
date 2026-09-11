@@ -181,7 +181,23 @@ with st.sidebar:
                          use_container_width=True,
                          type="primary" if _is_sel else "secondary"):
                 st.session_state.mp_sel = _pn; st.rerun()
-            if _rec:
+            # Show live counts if the plant is running or done
+            _rt2_suc  = _rt2.get("live_success", 0)
+            _rt2_fal  = _rt2.get("live_failed", 0)
+            _rt2_skp  = _rt2.get("live_skipped", 0)
+            _rt2_tot  = _rt2.get("progress_total", 0) or _rec
+            _rt2_pend = max(0, _rt2_tot - (_rt2_suc + _rt2_fal + _rt2_skp))
+            if _rt2.get("running") or _rt2.get("done"):
+                st.markdown(
+                    f'<div style="font-size:.68rem;margin-top:-6px;padding-left:4px;'
+                    f'display:flex;gap:6px;flex-wrap:wrap;">'
+                    f'<span style="color:#34d399;">✅{_rt2_suc}</span>'
+                    f'<span style="color:#f87171;">❌{_rt2_fal}</span>'
+                    f'<span style="color:#fbbf24;">⏳{_rt2_pend}</span>'
+                    f'<span style="color:#64748b;">/{_rt2_tot}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True)
+            elif _rec:
                 st.markdown(f'<div style="font-size:.7rem;color:#64748b;margin-top:-8px;'
                             f'padding-left:4px;">{_rec} records loaded</div>',
                             unsafe_allow_html=True)
@@ -189,9 +205,10 @@ with st.sidebar:
 
     st.markdown('<hr style="border-color:rgba(255,255,255,.08);margin:8px 0;">', unsafe_allow_html=True)
     _running_count = sum(1 for r in st.session_state.mp_rt.values() if r.get("running"))
+    _done_count_sb  = sum(1 for r in st.session_state.mp_rt.values() if r.get("done"))
     st.markdown(
         f'<div style="font-size:.78rem;color:#94a3b8;text-align:center;">'
-        f'{"🟡 "+str(_running_count)+" plant(s) running" if _running_count else "No plants running"}'
+        f'{"🟡 "+str(_running_count)+" plant(s) running" if _running_count else ("✅ All done" if _done_count_sb else "No plants running")}'
         f'</div>', unsafe_allow_html=True)
     if st.button("🔄 Refresh Plants", key="mp_refresh", use_container_width=True):
         _refresh_plants(); st.rerun()
@@ -210,6 +227,57 @@ if not _db_plants or st.session_state.mp_sel is None:
       </div>
     </div>""", unsafe_allow_html=True)
     st.stop()
+
+# ── Multi-plant summary dashboard (visible when ≥2 plants active) ─────────────
+_active_plants = [
+    (pn, rt) for pn, rt in st.session_state.mp_rt.items()
+    if rt.get("running") or rt.get("done") or rt.get("draining")
+]
+if len(_active_plants) >= 2:
+    # Build summary rows HTML
+    _rows_html = ""
+    for _apn, _art in _active_plants:
+        _a_suc  = _art.get("live_success", 0)
+        _a_fal  = _art.get("live_failed", 0)
+        _a_skp  = _art.get("live_skipped", 0)
+        _a_tot  = _art.get("progress_total", 0) or len(st.session_state.mp_cfg.get(_apn, {}).get("records", []))
+        _a_pend = max(0, _a_tot - (_a_suc + _a_fal + _a_skp))
+        if _art.get("running"):
+            _a_ico, _a_clr = "🟡", "#fbbf24"
+            _a_label = "Running"
+        elif _art.get("done") and _a_fal == 0:
+            _a_ico, _a_clr = "✅", "#34d399"
+            _a_label = "Complete"
+        elif _art.get("done"):
+            _a_ico, _a_clr = "⚠️", "#f87171"
+            _a_label = f"Done ({_a_fal} failed)"
+        else:
+            _a_ico, _a_clr = "🔄", "#94a3b8"
+            _a_label = "Finishing…"
+        _rows_html += (
+            f'<div style="display:grid;grid-template-columns:auto 1fr auto auto auto auto;'
+            f'gap:8px;align-items:center;padding:8px 12px;'
+            f'border-bottom:1px solid rgba(255,255,255,.05);">'
+            f'<span style="font-size:.85rem;">{_a_ico}</span>'
+            f'<span style="font-weight:600;color:#e2e8f0;font-size:.85rem;">{_apn}</span>'
+            f'<span style="color:#34d399;font-size:.82rem;font-weight:700;">✅ {_a_suc}</span>'
+            f'<span style="color:#f87171;font-size:.82rem;font-weight:700;">❌ {_a_fal}</span>'
+            f'<span style="color:#fbbf24;font-size:.82rem;font-weight:700;">⏳ {_a_pend}</span>'
+            f'<span style="color:#64748b;font-size:.78rem;">/{_a_tot}</span>'
+            f'</div>'
+        )
+    st.markdown(f"""
+<div style="background:rgba(15,23,42,.9);border:1px solid rgba(255,255,255,.1);
+border-radius:12px;margin-bottom:16px;overflow:hidden;">
+  <div style="background:rgba(255,255,255,.04);padding:10px 14px;
+  border-bottom:1px solid rgba(255,255,255,.08);
+  display:flex;justify-content:space-between;align-items:center;">
+    <span style="font-size:.78rem;font-weight:700;color:#94a3b8;
+    text-transform:uppercase;letter-spacing:1px;">🏭 All Plants — Live Status</span>
+    <span style="font-size:.72rem;color:#475569;">Updates every 0.8 s</span>
+  </div>
+  {_rows_html}
+</div>""", unsafe_allow_html=True)
 
 # ── Main area — selected plant ────────────────────────────────────────────────
 _sel  = st.session_state.mp_sel
@@ -395,7 +463,6 @@ with _col_l:
             import importlib, config as _lc, automation as _la, platform
             importlib.reload(_lc); importlib.reload(_la)
             from automation import run_batch as _rb
-            config.DELAY_BETWEEN_RECORDS = 3.0
 
             _lrt = st.session_state.mp_rt[_sel]
 
@@ -447,7 +514,6 @@ with _col_l:
                     return None  # stop was requested
 
                 try:
-                    config.DELAY_BETWEEN_RECORDS = _ps["delay"]
                     res = loop.run_until_complete(_rb2(
                         records=_ps["records"], username=_ps["username"],
                         password=_ps["password"],
@@ -457,6 +523,7 @@ with _col_l:
                         headless=_h, pdf_folder=_ps["pdf_folder"],
                         mode=_ps["mode"], chrome_profile_dir=_prof,
                         stop_event=_r["stop_event"],
+                        delay=_ps["delay"],
                     ))
                     try: _lq.put("__RESULTS__"+json.dumps(res, default=str))
                     except: pass

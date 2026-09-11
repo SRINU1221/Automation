@@ -3241,6 +3241,7 @@ async def run_batch(
     mode:        str = "MDL",
     chrome_profile_dir: Optional[str] = None,
     stop_event = None,   # threading.Event — when set, stops immediately & closes browser
+    delay:       float = None,  # per-plant delay between records (overrides config.DELAY_BETWEEN_RECORDS)
 ) -> List[Dict]:
     """
     Login then generate one Transit Pass per record.
@@ -3339,8 +3340,9 @@ async def run_batch(
 
             # Brief pause between records (not after the last one)
             if i < total - 1 and not engine._stop:
-                log_fn(f"⏱️  Waiting {config.DELAY_BETWEEN_RECORDS}s before next record…")
-                await asyncio.sleep(config.DELAY_BETWEEN_RECORDS)
+                _delay = delay if delay is not None else config.DELAY_BETWEEN_RECORDS
+                log_fn(f"⏱️  Waiting {_delay}s before next record…")
+                await asyncio.sleep(_delay)
 
         s = sum(1 for r in records if "✅" in r.get("_status", ""))
         f = sum(1 for r in records if "❌" in r.get("_status", ""))
