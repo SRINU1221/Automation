@@ -98,10 +98,17 @@ if st.session_state.mp_sel not in [p["plant_name"] for p in _db_plants]:
     st.session_state.mp_sel = _db_plants[0]["plant_name"] if _db_plants else None
 
 # ── Drain ALL plant log queues on every rerun ─────────────────────────────────
+# Always drain every plant's queue regardless of running/done/draining state so
+# that no __RECORD_DONE__ or __PROGRESS__ signal is ever stranded in the queue.
 _any_running = False
 for _pn, _rt in st.session_state.mp_rt.items():
-    if not (_rt["running"] or _rt["done"] or _rt.get("draining")): continue
+    # Drain if the plant is active (running/done/draining) OR has queued items
+    _q_has_items = not _rt["log_q"].empty()
+    if not (_rt["running"] or _rt["done"] or _rt.get("draining") or _q_has_items):
+        continue
     if _rt["running"]: _any_running = True
+    # Keep auto-refresh alive while there are still messages waiting to be consumed
+    if _q_has_items: _any_running = True
     _had_items = False
     while True:
         try: _m = _rt["log_q"].get_nowait()
@@ -111,11 +118,13 @@ for _pn, _rt in st.session_state.mp_rt.items():
             _rt["otp_requested"] = True; _rt["otp_submitted"] = False
         elif _m.startswith("__ERROR__"):
             _rt["error_msg"] = _m[len("__ERROR__"):]
-            _rt["running"] = False; _rt["done"] = True; _rt["draining"] = False
+            _rt["running"] = False; _rt["done"] = True
+            # Keep draining=True so the next rerun catches the follow-up __DONE__
+            _rt["draining"] = True
         elif _m.startswith("__PROGRESS__"):
             try:
                 _prog = _m[len("__PROGRESS__"):]
-                d, t = _prog.split("__")
+                d, t = _prog.split("__", 1)   # maxsplit=1 — safe for any integer values
                 _rt["progress_done"] = int(d); _rt["progress_total"] = int(t)
             except Exception:
                 pass
@@ -547,11 +556,12 @@ with _col_l:
     if _rt["done"]:
         if st.button("🗑️ Reset This Plant", use_container_width=True, key=f"reset_{_sel}"):
             _rt["stop_event"].clear()
-            _rt.update({"done":False,"draining":False,"log_lines":[],"pdf_files":[],"error_msg":"",
+            _rt.update({"running":False,"done":False,"draining":False,"log_lines":[],"pdf_files":[],"error_msg":"",
                         "live_success":0,"live_failed":0,"live_skipped":0,
                         "progress_done":0,"progress_total":0,
                         "otp_requested":False,"otp_submitted":False})
             st.rerun()
+
 
 with _col_r:
     # Error popup

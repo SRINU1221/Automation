@@ -3296,6 +3296,10 @@ async def run_batch(
         for i, record in enumerate(records):
             if engine._stop:
                 log_fn("⏹️  Automation stopped by user.")
+                # Emit skipped signals for all remaining records (current + rest)
+                # so the live Pending counter reaches zero and counts stay accurate.
+                for _sk_rec in records[i:]:
+                    log_fn("__RECORD_DONE__skipped")
                 break
 
             log_fn(f"\n{'─'*55}")
@@ -3353,6 +3357,9 @@ async def run_batch(
 
     except MDLIDNotFoundError as mdl_err:
         # ── MDL ID mismatch — clear, actionable popup, stop entire plant ──
+        # Emit a failed signal for the record that triggered this error so the
+        # live count in the UI accounts for it.
+        log_fn("__RECORD_DONE__failed")
         mdl_id   = mdl_err.mdl_id
         avail    = mdl_err.available
         avail_str = ", ".join(avail[:8]) if avail else "(no options loaded)"
